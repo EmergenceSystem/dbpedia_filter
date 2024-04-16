@@ -1,0 +1,19 @@
+[package]
+name = "dbpedia_filter"
+version = "0.1.0"
+edition = "2021"
+license-file="LICENSE"
+
+[profile.dev]
+opt-level = 3
+
+[profile.release]
+opt-level = 3 
+
+[dependencies]
+embryo = { git = "ssh://git@github.com/EmergenceSystem/Embryo.git" }
+em_filter = { git = "ssh://git@github.com/EmergenceSystem/em_filter.git" }
+serde_json = "1.0"
+actix-web="4.0"
+tokio = { version = "1", features = ["full"] }
+reqwest = "0.11"
