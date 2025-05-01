@@ -1,0 +1,15 @@
+{application, dbpedia_filter, [
+    {description, "em_filter example for Dbpedia. Default dbo is Company"},
+    {vsn, "0.1.0"},
+    {registered, []},
+    {mod, {dbpedia_filter_app, []}},
+    {applications, [
+        kernel,
+        stdlib,
+        em_filter
+    ]},
+    {env, []},
+    {modules, []},
+    {licenses, ["Apache-2.0"]},
+    {links, [{"GitHub", "https://github.com/EmergenceSystem/dbpedia_filter"}]}
+]}.

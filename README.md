@@ -1,2 +1,9 @@
-# dbpedia_filter
-Dbpedia filter. Default dbo is Company.
+bing_filter
+=====
+
+An OTP application
+
+Build
+-----
+
+    $ rebar3 compile
