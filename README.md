@@ -1,7 +1,7 @@
-bing_filter
+dbpedia_filter
 =====
 
-An OTP application
+Em_filter example for Dbpedia, with default dbo as Company.
 
 Build
 -----
