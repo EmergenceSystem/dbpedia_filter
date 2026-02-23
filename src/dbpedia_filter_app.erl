@@ -1,30 +1,81 @@
 %%%-------------------------------------------------------------------
-%%% @doc DBpedia SPARQL filter.
+%%% @doc DBpedia SPARQL agent.
 %%%
 %%% Queries the DBpedia SPARQL endpoint for entities matching the
 %%% search value and returns their Wikipedia URL and abstract.
+%%%
+%%% As an agent this module:
+%%%   - Announces capabilities to em_disco on startup via `agent_hello'.
+%%%   - Maintains a memory of URLs already returned, so duplicate
+%%%     results across successive queries are filtered out.
+%%%
+%%% Handler contract: `handle/2' (Body, Memory) -> {RawList, NewMemory}.
+%%% Returns a raw Erlang list — em_filter_server encodes it.
+%%% Memory schema: `#{seen => #{binary_url => true}}'.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(dbpedia_filter_app).
 -behaviour(application).
 
 -export([start/2, stop/1]).
--export([handle/1]).
+-export([handle/1, handle/2]).
 
 -define(DBPEDIA_ENDPOINT, "https://dbpedia.org/sparql").
+
+-define(CAPABILITIES, [
+    <<"dbpedia">>,
+    <<"sparql">>,
+    <<"semantic">>,
+    <<"encyclopedia">>,
+    <<"wikipedia">>
+]).
 
 %%====================================================================
 %% Application behaviour
 %%====================================================================
 
 start(_StartType, _StartArgs) ->
-    em_filter:start_filter(dbpedia_filter, ?MODULE).
+    em_filter:start_agent(dbpedia_filter, ?MODULE, #{
+        capabilities => ?CAPABILITIES,
+        memory       => ets
+    }).
 
 stop(_State) ->
     em_filter:stop_filter(dbpedia_filter).
 
 %%====================================================================
-%% Filter handler — returns a list of embryo maps
+%% Agent handler — with memory (primary path)
+%%
+%% Memory holds the set of URLs already returned to the client.
+%% New results are filtered against this set before being returned,
+%% then the set is updated with the fresh URLs.
+%%
+%% Returns a raw list of embryo maps — NOT pre-encoded JSON.
+%% em_filter_server wraps and encodes the result.
+%%====================================================================
+
+handle(Body, Memory) when is_binary(Body) ->
+    Seen    = maps:get(seen, Memory, #{}),
+    Embryos = generate_embryo_list(Body),
+
+    %% Filter out URLs the agent has already returned in a previous query.
+    Fresh = [E || E <- Embryos,
+                  not maps:is_key(url_of(E), Seen)],
+
+    %% Accumulate newly seen URLs into memory.
+    NewSeen = lists:foldl(fun(E, Acc) ->
+        Acc#{url_of(E) => true}
+    end, Seen, Fresh),
+
+    {Fresh, Memory#{seen => NewSeen}};
+
+handle(_Body, Memory) ->
+    {[], Memory}.
+
+%%====================================================================
+%% Plain filter handler — kept for backward compatibility.
+%% Called when the agent is started without memory (handle/1 path).
+%% Returns a raw list — em_filter_server encodes it.
 %%====================================================================
 
 handle(Body) when is_binary(Body) ->
@@ -33,7 +84,7 @@ handle(_) ->
     [].
 
 %%====================================================================
-%% Search and processing
+%% Search and processing (unchanged)
 %%====================================================================
 
 generate_embryo_list(JsonBinary) ->
@@ -73,6 +124,7 @@ extract_params(JsonBinary) ->
 build_sparql_query(Value, Dbo) ->
     lists:flatten(io_lib:format(
         "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> "
+        "PREFIX foaf: <http://xmlns.com/foaf/0.1/> "
         "SELECT DISTINCT ?url ?abstract "
         "WHERE {{ "
         "  {{ "
@@ -87,7 +139,7 @@ build_sparql_query(Value, Dbo) ->
         "}} ", [Value, Dbo])).
 
 %%--------------------------------------------------------------------
-%% Response parsing
+%% Response parsing (unchanged)
 %%--------------------------------------------------------------------
 
 parse_dbpedia_response(Body, StartTime, Timeout) ->
@@ -138,3 +190,12 @@ get_path(Json, [Key | Rest]) when is_map(Json) ->
         error       -> undefined
     end;
 get_path(_, _) -> undefined.
+
+%%====================================================================
+%% Internal helpers
+%%====================================================================
+
+%% Extracts the URL from an embryo map for memory tracking.
+-spec url_of(map()) -> binary().
+url_of(#{<<"properties">> := #{<<"url">> := Url}}) -> Url;
+url_of(_) -> <<>>.
