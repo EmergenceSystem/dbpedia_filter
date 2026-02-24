@@ -4,6 +4,7 @@
 %%% Uses the DBpedia Lookup API to find matching entities, then
 %%% enriches each hit with its English abstract via a targeted
 %%% SPARQL query on the known URI (no full-scan, no timeout).
+%%% The Lookup API returns XML — parsed with regex.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(dbpedia_filter_app).
@@ -68,21 +69,21 @@ generate_embryo_list(JsonBinary) ->
             enrich_with_abstracts(Hits, Timeout)
     end.
 
-%% Step 1: DBpedia Lookup API — fast fulltext search, returns URIs + snippets.
+%% Step 1: DBpedia Lookup API — returns XML regardless of Accept header.
+%% Uses legacy query params: QueryString and MaxHits.
 lookup(Value, TypeClass, Timeout) ->
     TypeParam = case TypeClass of
         ""  -> "";
-        _   -> "&typeName=" ++ uri_string:quote(TypeClass)
+        _   -> "&QueryClass=" ++ uri_string:quote(TypeClass)
     end,
     Url = ?LOOKUP_ENDPOINT
-          ++ "?query=" ++ uri_string:quote(Value)
-          ++ "&maxResults=" ++ integer_to_list(?MAX_RESULTS)
+          ++ "?QueryString=" ++ uri_string:quote(Value)
+          ++ "&MaxHits=" ++ integer_to_list(?MAX_RESULTS)
           ++ TypeParam,
-    Headers = [{"Accept", "application/json"}],
-    case httpc:request(get, {Url, Headers}, [{timeout, Timeout * 1000}],
+    case httpc:request(get, {Url, []}, [{timeout, Timeout * 1000}],
                        [{body_format, binary}]) of
         {ok, {{_, 200, _}, _, Body}} ->
-            parse_lookup_response(Body);
+            parse_lookup_xml(Body);
         {ok, {{_, Status, _}, _, _}} ->
             io:format("[dbpedia] lookup HTTP ~p~n", [Status]),
             [];
@@ -91,31 +92,20 @@ lookup(Value, TypeClass, Timeout) ->
             []
     end.
 
-parse_lookup_response(Body) ->
-    try json:decode(Body) of
-        #{<<"docs">> := Docs} when is_list(Docs) ->
-            [extract_hit(D) || D <- Docs];
-        _ -> []
-    catch
-        _:_ -> []
+%% Parse XML: extract all <URI> and <Description> pairs.
+parse_lookup_xml(Body) ->
+    Uris  = re_all(Body, <<"<URI>([^<]+)</URI>">>),
+    Descs = re_all(Body, <<"<Description>([^<]*)</Description>">>),
+    Padded = Descs ++ lists:duplicate(max(0, length(Uris) - length(Descs)), undefined),
+    [#{uri => U, comment => D} || {U, D} <- lists:zip(Uris, Padded)].
+
+re_all(Body, Re) ->
+    case re:run(Body, Re, [global, {capture, all_but_first, binary}]) of
+        {match, Matches} -> [M || [M] <- Matches];
+        _                -> []
     end.
 
-%% Each doc has "resource" (list with URI) and optionally "comment".
-extract_hit(Doc) ->
-    Uri = case maps:get(<<"resource">>, Doc, []) of
-        [U | _] -> U;
-        _       -> undefined
-    end,
-    WikiUrl = maps:get(<<"wikidataId">>, Doc, undefined),
-    %% Lookup gives a short comment, we'll try to get the full abstract next.
-    Comment = case maps:get(<<"comment">>, Doc, []) of
-        [C | _] -> C;
-        _       -> undefined
-    end,
-    #{uri => Uri, wiki_url => WikiUrl, comment => Comment}.
-
-%% Step 2: for each hit that has a URI, fetch the English abstract via SPARQL.
-%% We batch all URIs in a single VALUES query to avoid N round-trips.
+%% Step 2: batch SPARQL to fetch English abstracts for all found URIs.
 enrich_with_abstracts([], _Timeout) -> [];
 enrich_with_abstracts(Hits, Timeout) ->
     Uris = [Uri || #{uri := Uri} <- Hits, Uri =/= undefined],
@@ -132,18 +122,15 @@ enrich_with_abstracts(Hits, Timeout) ->
     end, Hits).
 
 uri_to_wiki(Uri) when is_binary(Uri) ->
-    %% http://dbpedia.org/resource/Apple_Inc -> https://en.wikipedia.org/wiki/Apple_Inc
     case binary:split(Uri, <<"/resource/">>) of
-        [_, Name] ->
-            <<"https://en.wikipedia.org/wiki/", Name/binary>>;
-        _ ->
-            undefined
+        [_, Name] -> <<"https://en.wikipedia.org/wiki/", Name/binary>>;
+        _         -> undefined
     end;
 uri_to_wiki(_) -> undefined.
 
 fetch_abstracts([], _Timeout) -> #{};
 fetch_abstracts(Uris, Timeout) ->
-    Values  = string:join(
+    Values = string:join(
         [lists:flatten(io_lib:format("(<~s>)", [binary_to_list(U)])) || U <- Uris],
         " "),
     Query = lists:flatten(io_lib:format(
@@ -163,7 +150,8 @@ fetch_abstracts(Uris, Timeout) ->
                        [{body_format, binary}]) of
         {ok, {{_, 200, _}, _, Body}} ->
             parse_abstract_response(Body);
-        _ ->
+        {error, Reason} ->
+            io:format("[dbpedia] sparql failed: ~p~n", [Reason]),
             #{}
     end.
 
@@ -176,8 +164,7 @@ parse_abstract_response(Body) ->
                         S = get_path(B, [<<"s">>,        <<"value">>]),
                         A = get_path(B, [<<"abstract">>, <<"value">>]),
                         case {S, A} of
-                            {Su, Ab} when is_binary(Su), is_binary(Ab) ->
-                                Acc#{Su => Ab};
+                            {Su, Ab} when is_binary(Su), is_binary(Ab) -> Acc#{Su => Ab};
                             _ -> Acc
                         end
                     end, #{}, Bindings);
@@ -194,8 +181,8 @@ parse_abstract_response(Body) ->
 extract_params(JsonBinary) ->
     try json:decode(JsonBinary) of
         Map when is_map(Map) ->
-            Value = binary_to_list(maps:get(<<"value">>, Map, <<"">>)),
-            Timeout = case maps:get(<<"timeout">>, Map, undefined) of
+            Value     = binary_to_list(maps:get(<<"value">>,   Map, <<"">>)),
+            Timeout   = case maps:get(<<"timeout">>, Map, undefined) of
                 undefined            -> 10;
                 T when is_integer(T) -> T;
                 T when is_binary(T)  -> binary_to_integer(T)
