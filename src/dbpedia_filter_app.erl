@@ -1,26 +1,20 @@
 %%%-------------------------------------------------------------------
 %%% @doc DBpedia SPARQL agent.
 %%%
-%%% Queries the DBpedia SPARQL endpoint for entities matching the
-%%% search value and returns their Wikipedia URL and abstract.
-%%%
-%%% As an agent this module:
-%%%   - Announces capabilities to em_disco on startup via `agent_hello'.
-%%%   - Maintains a memory of URLs already returned, so duplicate
-%%%     results across successive queries are filtered out.
-%%%
-%%% Handler contract: `handle/2' (Body, Memory) -> {RawList, NewMemory}.
-%%% Returns a raw Erlang list — em_filter_server encodes it.
-%%% Memory schema: `#{seen => #{binary_url => true}}'.
+%%% Uses the DBpedia Lookup API to find matching entities, then
+%%% enriches each hit with its English abstract via a targeted
+%%% SPARQL query on the known URI (no full-scan, no timeout).
 %%% @end
 %%%-------------------------------------------------------------------
 -module(dbpedia_filter_app).
 -behaviour(application).
 
 -export([start/2, stop/1]).
--export([handle/1, handle/2]).
+-export([handle/2]).
 
--define(DBPEDIA_ENDPOINT, "https://dbpedia.org/sparql").
+-define(LOOKUP_ENDPOINT, "https://lookup.dbpedia.org/api/search").
+-define(SPARQL_ENDPOINT, "https://dbpedia.org/sparql").
+-define(MAX_RESULTS, 10).
 
 -define(CAPABILITIES, [
     <<"dbpedia">>,
@@ -41,148 +35,179 @@ start(_StartType, _StartArgs) ->
     }).
 
 stop(_State) ->
-    em_filter:stop_filter(dbpedia_filter).
+    em_filter:stop_agent(dbpedia_filter).
 
 %%====================================================================
-%% Agent handler — with memory (primary path)
-%%
-%% Memory holds the set of URLs already returned to the client.
-%% New results are filtered against this set before being returned,
-%% then the set is updated with the fresh URLs.
-%%
-%% Returns a raw list of embryo maps — NOT pre-encoded JSON.
-%% em_filter_server wraps and encodes the result.
+%% Agent handler
 %%====================================================================
 
 handle(Body, Memory) when is_binary(Body) ->
     Seen    = maps:get(seen, Memory, #{}),
     Embryos = generate_embryo_list(Body),
-
-    %% Filter out URLs the agent has already returned in a previous query.
-    Fresh = [E || E <- Embryos,
-                  not maps:is_key(url_of(E), Seen)],
-
-    %% Accumulate newly seen URLs into memory.
+    Fresh   = [E || E <- Embryos, not maps:is_key(url_of(E), Seen)],
+    io:format("[dbpedia] value=~p results=~p fresh=~p~n",
+              [Body, length(Embryos), length(Fresh)]),
     NewSeen = lists:foldl(fun(E, Acc) ->
         Acc#{url_of(E) => true}
     end, Seen, Fresh),
-
     {Fresh, Memory#{seen => NewSeen}};
 
 handle(_Body, Memory) ->
     {[], Memory}.
 
 %%====================================================================
-%% Plain filter handler — kept for backward compatibility.
-%% Called when the agent is started without memory (handle/1 path).
-%% Returns a raw list — em_filter_server encodes it.
-%%====================================================================
-
-handle(Body) when is_binary(Body) ->
-    generate_embryo_list(Body);
-handle(_) ->
-    [].
-
-%%====================================================================
-%% Search and processing (unchanged)
+%% Pipeline: Lookup -> abstract enrichment
 %%====================================================================
 
 generate_embryo_list(JsonBinary) ->
-    {Value, Timeout, Dbo} = extract_params(JsonBinary),
-    Query = build_sparql_query(Value, Dbo),
-    Params = "query=" ++ uri_string:quote(Query),
+    {Value, Timeout, TypeClass} = extract_params(JsonBinary),
+    case Value of
+        [] -> [];
+        _  ->
+            Hits = lookup(Value, TypeClass, Timeout),
+            enrich_with_abstracts(Hits, Timeout)
+    end.
+
+%% Step 1: DBpedia Lookup API — fast fulltext search, returns URIs + snippets.
+lookup(Value, TypeClass, Timeout) ->
+    TypeParam = case TypeClass of
+        ""  -> "";
+        _   -> "&typeName=" ++ uri_string:quote(TypeClass)
+    end,
+    Url = ?LOOKUP_ENDPOINT
+          ++ "?query=" ++ uri_string:quote(Value)
+          ++ "&maxResults=" ++ integer_to_list(?MAX_RESULTS)
+          ++ TypeParam,
+    Headers = [{"Accept", "application/json"}],
+    case httpc:request(get, {Url, Headers}, [{timeout, Timeout * 1000}],
+                       [{body_format, binary}]) of
+        {ok, {{_, 200, _}, _, Body}} ->
+            parse_lookup_response(Body);
+        {ok, {{_, Status, _}, _, _}} ->
+            io:format("[dbpedia] lookup HTTP ~p~n", [Status]),
+            [];
+        {error, Reason} ->
+            io:format("[dbpedia] lookup failed: ~p~n", [Reason]),
+            []
+    end.
+
+parse_lookup_response(Body) ->
+    try json:decode(Body) of
+        #{<<"docs">> := Docs} when is_list(Docs) ->
+            [extract_hit(D) || D <- Docs];
+        _ -> []
+    catch
+        _:_ -> []
+    end.
+
+%% Each doc has "resource" (list with URI) and optionally "comment".
+extract_hit(Doc) ->
+    Uri = case maps:get(<<"resource">>, Doc, []) of
+        [U | _] -> U;
+        _       -> undefined
+    end,
+    WikiUrl = maps:get(<<"wikidataId">>, Doc, undefined),
+    %% Lookup gives a short comment, we'll try to get the full abstract next.
+    Comment = case maps:get(<<"comment">>, Doc, []) of
+        [C | _] -> C;
+        _       -> undefined
+    end,
+    #{uri => Uri, wiki_url => WikiUrl, comment => Comment}.
+
+%% Step 2: for each hit that has a URI, fetch the English abstract via SPARQL.
+%% We batch all URIs in a single VALUES query to avoid N round-trips.
+enrich_with_abstracts([], _Timeout) -> [];
+enrich_with_abstracts(Hits, Timeout) ->
+    Uris = [Uri || #{uri := Uri} <- Hits, Uri =/= undefined],
+    AbstractMap = fetch_abstracts(Uris, Timeout),
+    lists:filtermap(fun(#{uri := Uri, comment := Comment}) ->
+        Abstract = maps:get(Uri, AbstractMap, Comment),
+        WikiUrl  = uri_to_wiki(Uri),
+        case {WikiUrl, Abstract} of
+            {W, A} when is_binary(W), is_binary(A) ->
+                {true, #{<<"properties">> => #{<<"url">> => W, <<"resume">> => A}}};
+            _ ->
+                false
+        end
+    end, Hits).
+
+uri_to_wiki(Uri) when is_binary(Uri) ->
+    %% http://dbpedia.org/resource/Apple_Inc -> https://en.wikipedia.org/wiki/Apple_Inc
+    case binary:split(Uri, <<"/resource/">>) of
+        [_, Name] ->
+            <<"https://en.wikipedia.org/wiki/", Name/binary>>;
+        _ ->
+            undefined
+    end;
+uri_to_wiki(_) -> undefined.
+
+fetch_abstracts([], _Timeout) -> #{};
+fetch_abstracts(Uris, Timeout) ->
+    Values  = string:join(
+        [lists:flatten(io_lib:format("(<~s>)", [binary_to_list(U)])) || U <- Uris],
+        " "),
+    Query = lists:flatten(io_lib:format(
+        "PREFIX dbo: <http://dbpedia.org/ontology/> "
+        "SELECT ?s ?abstract WHERE { "
+        "  VALUES (?s) { ~s } "
+        "  ?s dbo:abstract ?abstract . "
+        "  FILTER (langMatches(lang(?abstract), \"en\")) "
+        "} LIMIT ~p",
+        [Values, length(Uris)])),
+    Params  = "query=" ++ uri_string:quote(Query),
     Headers = [{"Accept", "application/sparql-results+json"}],
-    StartTime = erlang:system_time(millisecond),
     case httpc:request(post,
-                       {?DBPEDIA_ENDPOINT, Headers,
+                       {?SPARQL_ENDPOINT, Headers,
                         "application/x-www-form-urlencoded", Params},
                        [{timeout, Timeout * 1000}],
                        [{body_format, binary}]) of
         {ok, {{_, 200, _}, _, Body}} ->
-            parse_dbpedia_response(Body, StartTime, Timeout * 1000);
+            parse_abstract_response(Body);
         _ ->
-            []
+            #{}
     end.
+
+parse_abstract_response(Body) ->
+    try json:decode(Body) of
+        Json ->
+            case get_path(Json, [<<"results">>, <<"bindings">>]) of
+                Bindings when is_list(Bindings) ->
+                    lists:foldl(fun(B, Acc) ->
+                        S = get_path(B, [<<"s">>,        <<"value">>]),
+                        A = get_path(B, [<<"abstract">>, <<"value">>]),
+                        case {S, A} of
+                            {Su, Ab} when is_binary(Su), is_binary(Ab) ->
+                                Acc#{Su => Ab};
+                            _ -> Acc
+                        end
+                    end, #{}, Bindings);
+                _ -> #{}
+            end
+    catch
+        _:_ -> #{}
+    end.
+
+%%====================================================================
+%% Helpers
+%%====================================================================
 
 extract_params(JsonBinary) ->
     try json:decode(JsonBinary) of
         Map when is_map(Map) ->
-            Value   = binary_to_list(maps:get(<<"value">>,   Map, <<"">>)),
+            Value = binary_to_list(maps:get(<<"value">>, Map, <<"">>)),
             Timeout = case maps:get(<<"timeout">>, Map, undefined) of
                 undefined            -> 10;
                 T when is_integer(T) -> T;
                 T when is_binary(T)  -> binary_to_integer(T)
             end,
-            Dbo = binary_to_list(maps:get(<<"dbo">>, Map, <<"Company">>)),
-            {Value, Timeout, Dbo};
+            TypeClass = binary_to_list(maps:get(<<"dbo">>, Map, <<"">>)),
+            {Value, Timeout, TypeClass};
         _ ->
-            {binary_to_list(JsonBinary), 10, "Company"}
+            {binary_to_list(JsonBinary), 10, ""}
     catch
-        _:_ -> {binary_to_list(JsonBinary), 10, "Company"}
+        _:_ -> {binary_to_list(JsonBinary), 10, ""}
     end.
 
-build_sparql_query(Value, Dbo) ->
-    lists:flatten(io_lib:format(
-        "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> "
-        "PREFIX foaf: <http://xmlns.com/foaf/0.1/> "
-        "SELECT DISTINCT ?url ?abstract "
-        "WHERE {{ "
-        "  {{ "
-        "    ?s a ?type ; "
-        "      rdfs:label ?label ; "
-        "      <http://dbpedia.org/ontology/abstract> ?abstract ; "
-        "      foaf:isPrimaryTopicOf ?url . "
-        "      FILTER (langMatches(lang(?abstract), \"en\")) "
-        "      FILTER (contains(?label, \"~s\")) "
-        "      FILTER (?type IN (<http://dbpedia.org/ontology/~s>)) "
-        "  }} "
-        "}} ", [Value, Dbo])).
-
-%%--------------------------------------------------------------------
-%% Response parsing (unchanged)
-%%--------------------------------------------------------------------
-
-parse_dbpedia_response(Body, StartTime, Timeout) ->
-    try json:decode(Body) of
-        Json ->
-            case get_path(Json, [<<"results">>, <<"bindings">>]) of
-                Bindings when is_list(Bindings) ->
-                    process_bindings(Bindings, StartTime, Timeout, []);
-                _ ->
-                    []
-            end
-    catch
-        _:_ -> []
-    end.
-
-process_bindings([], _StartTime, _Timeout, Acc) ->
-    lists:reverse(Acc);
-process_bindings([Binding | Rest], StartTime, Timeout, Acc) ->
-    case erlang:system_time(millisecond) - StartTime >= Timeout of
-        true  -> lists:reverse(Acc);
-        false ->
-            NewAcc = case process_binding(Binding) of
-                {ok, Embryo} -> [Embryo | Acc];
-                skip         -> Acc
-            end,
-            process_bindings(Rest, StartTime, Timeout, NewAcc)
-    end.
-
-process_binding(Binding) ->
-    Url      = get_path(Binding, [<<"url">>,      <<"value">>]),
-    Abstract = get_path(Binding, [<<"abstract">>, <<"value">>]),
-    case {Url, Abstract} of
-        {U, A} when is_binary(U), is_binary(A) ->
-            {ok, #{
-                <<"properties">> => #{
-                    <<"url">>    => U,
-                    <<"resume">> => A
-                }
-            }};
-        _ -> skip
-    end.
-
-%% Safely traverses a nested map structure.
 get_path(Json, []) -> Json;
 get_path(Json, [Key | Rest]) when is_map(Json) ->
     case maps:find(Key, Json) of
@@ -191,11 +216,6 @@ get_path(Json, [Key | Rest]) when is_map(Json) ->
     end;
 get_path(_, _) -> undefined.
 
-%%====================================================================
-%% Internal helpers
-%%====================================================================
-
-%% Extracts the URL from an embryo map for memory tracking.
 -spec url_of(map()) -> binary().
 url_of(#{<<"properties">> := #{<<"url">> := Url}}) -> Url;
 url_of(_) -> <<>>.
