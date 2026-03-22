@@ -3,27 +3,36 @@
 %%%
 %%% Uses the DBpedia Lookup API to find matching entities, then
 %%% enriches each hit with its English abstract via a targeted
-%%% SPARQL query on the known URI (no full-scan, no timeout).
-%%% The Lookup API returns XML — parsed with regex.
+%%% SPARQL query on the known URI.
+%%%
+%%% Deduplication by URL is handled upstream by the Emquest pipeline.
+%%%
+%%% === Capability cascade ===
+%%%
+%%%   base_capabilities/0 extends em_filter:base_capabilities().
+%%%
+%%% Handler contract: handle/2 (Body, Memory) -> {RawList, Memory}.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(dbpedia_filter_app).
 -behaviour(application).
 
 -export([start/2, stop/1]).
--export([handle/2]).
+-export([handle/2, base_capabilities/0]).
 
 -define(LOOKUP_ENDPOINT, "https://lookup.dbpedia.org/api/search").
 -define(SPARQL_ENDPOINT, "https://dbpedia.org/sparql").
 -define(MAX_RESULTS, 10).
 
--define(CAPABILITIES, [
-    <<"dbpedia">>,
-    <<"sparql">>,
-    <<"semantic">>,
-    <<"encyclopedia">>,
-    <<"wikipedia">>
-]).
+%%====================================================================
+%% Capability cascade
+%%====================================================================
+
+-spec base_capabilities() -> [binary()].
+base_capabilities() ->
+    em_filter:base_capabilities() ++ [<<"dbpedia">>, <<"sparql">>,
+                                      <<"semantic">>, <<"encyclopedia">>,
+                                      <<"wikipedia">>].
 
 %%====================================================================
 %% Application behaviour
@@ -31,9 +40,9 @@
 
 start(_StartType, _StartArgs) ->
     em_filter:start_agent(dbpedia_filter, ?MODULE, #{
-        capabilities => ?CAPABILITIES,
-        memory       => ets
-    }).
+        capabilities => base_capabilities()
+    }),
+    {ok, self()}.
 
 stop(_State) ->
     em_filter:stop_agent(dbpedia_filter).
@@ -43,16 +52,7 @@ stop(_State) ->
 %%====================================================================
 
 handle(Body, Memory) when is_binary(Body) ->
-    Seen    = maps:get(seen, Memory, #{}),
-    Embryos = generate_embryo_list(Body),
-    Fresh   = [E || E <- Embryos, not maps:is_key(url_of(E), Seen)],
-    io:format("[dbpedia] value=~p results=~p fresh=~p~n",
-              [Body, length(Embryos), length(Fresh)]),
-    NewSeen = lists:foldl(fun(E, Acc) ->
-        Acc#{url_of(E) => true}
-    end, Seen, Fresh),
-    {Fresh, Memory#{seen => NewSeen}};
-
+    {generate_embryo_list(Body), Memory};
 handle(_Body, Memory) ->
     {[], Memory}.
 
@@ -69,8 +69,6 @@ generate_embryo_list(JsonBinary) ->
             enrich_with_abstracts(Hits, Timeout)
     end.
 
-%% Step 1: DBpedia Lookup API — returns XML regardless of Accept header.
-%% Uses legacy query params: QueryString and MaxHits.
 lookup(Value, TypeClass, Timeout) ->
     TypeParam = case TypeClass of
         ""  -> "";
@@ -92,7 +90,6 @@ lookup(Value, TypeClass, Timeout) ->
             []
     end.
 
-%% Parse XML: extract all <URI> and <Description> pairs.
 parse_lookup_xml(Body) ->
     Uris  = re_all(Body, <<"<URI>([^<]+)</URI>">>),
     Descs = re_all(Body, <<"<Description>([^<]*)</Description>">>),
@@ -105,7 +102,6 @@ re_all(Body, Re) ->
         _                -> []
     end.
 
-%% Step 2: batch SPARQL to fetch English abstracts for all found URIs.
 enrich_with_abstracts([], _Timeout) -> [];
 enrich_with_abstracts(Hits, Timeout) ->
     Uris = [Uri || #{uri := Uri} <- Hits, Uri =/= undefined],
@@ -181,7 +177,8 @@ parse_abstract_response(Body) ->
 extract_params(JsonBinary) ->
     try json:decode(JsonBinary) of
         Map when is_map(Map) ->
-            Value     = binary_to_list(maps:get(<<"value">>,   Map, <<"">>)),
+            Value     = binary_to_list(maps:get(<<"value">>, Map,
+                            maps:get(<<"query">>, Map, <<"">>))),
             Timeout   = case maps:get(<<"timeout">>, Map, undefined) of
                 undefined            -> 10;
                 T when is_integer(T) -> T;
@@ -202,7 +199,3 @@ get_path(Json, [Key | Rest]) when is_map(Json) ->
         error       -> undefined
     end;
 get_path(_, _) -> undefined.
-
--spec url_of(map()) -> binary().
-url_of(#{<<"properties">> := #{<<"url">> := Url}}) -> Url;
-url_of(_) -> <<>>.
