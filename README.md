@@ -1,9 +1,16 @@
-dbpedia_filter
-=====
+# dbpedia_filter
 
-Em_filter example for Dbpedia, with default dbo as Company.
+A source filter for **[EmergenceSystem](https://github.com/EmergenceSystem)**, a distributed
+discovery network of small agents. It joins the em_pop gossip mesh and answers
+`POST /agent/query`: it searches structured entities from DBpedia (the DBpedia Lookup API), returned as embryos (title, url, short summary).
 
-Build
------
+Emquest fans a query out to many such filters in parallel and aggregates the results,
+so each filter stays small and focused on a single source.
 
-    $ rebar3 compile
+## Run
+
+```sh
+rebar3 shell
+```
+
+Built on [em_filter](https://github.com/EmergenceSystem/em_filter). Apache-2.0.
